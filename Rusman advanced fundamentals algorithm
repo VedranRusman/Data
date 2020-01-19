@@ -1,0 +1,614 @@
+from quantopian.algorithm import attach_pipeline, pipeline_output, order_optimal_portfolio
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.factors import CustomFactor, SimpleBeta, Returns, RollingSpearmanOfReturns, SimpleMovingAverage
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.data import Fundamentals
+import quantopian.optimize as opt
+from sklearn import preprocessing
+from quantopian.pipeline.experimental import risk_loading_pipeline
+from quantopian.pipeline.filters import QTradableStocksUS
+from quantopian.pipeline.data.psychsignal import stocktwits
+from quantopian.pipeline.classifiers.fundamentals import Sector
+from scipy.stats.mstats import winsorize
+#from quantopian.pipeline.data.org_5ca4bd9ec96e4b000b7559ad import short_volume_v1
+from zipline.utils.numpy_utils import (
+    repeat_first_axis,
+    repeat_last_axis,
+)
+#from quantopian.pipeline.data import factset
+from scipy import stats
+#from scipy.stats.mstats import gmean
+import numpy as np
+import pandas as pd
+
+
+MAX_POSITION_SIZE = 0.004
+WIN_LIMIT = 0.01
+MIN_TURN = 0.33
+BETA_EXPOSURE = 0
+
+#Sectors
+sector = Sector()
+
+# SECTOR CODES
+MORNINGSTAR_SECTOR_CODES = {-1: 'Misc',
+                            101: 'Basic Materials',
+                            102: 'Consumer Cyclical',
+                            103: 'Financial Services',
+                            104: 'Real Estate',
+                            205: 'Consumer Defensive',
+                            206: 'Healthcare',
+                            207: 'Utilities',
+                            308: 'Communication Services',
+                            309: 'Energy',
+                            310: 'Industrials',
+                            311: 'Technology',    
+                           } 
+        
+def make_factors():
+    
+        
+        class inv_volatility(CustomFactor):  
+            inputs = [USEquityPricing.close]  
+            window_length = 380
+       
+            def compute(self, today, assets, out, close):  
+                daily_returns = np.diff(close, axis = 0) / close[0:-1]
+                inv_vola = (1/daily_returns.std(axis = 0)) 
+                inv_vola = stats.zscore(inv_vola)
+                out[:] = preprocess(inv_vola)
+         
+        class MessageSum(CustomFactor):
+            inputs = [USEquityPricing.high, USEquityPricing.low, USEquityPricing.close, stocktwits.bull_scored_messages, stocktwits.bear_scored_messages]
+            window_length = 5
+            def compute(self, today, assets, out, high, low, close, bull, bear):
+                v = np.nansum((high-low)/close, axis=0)
+                out[:] = preprocess(v*np.nansum(bear-bull))
+                
+        class fcf(CustomFactor):
+            inputs = [Fundamentals.fcf_yield]
+            window_length = 1
+            def compute(self, today, assets, out, fcf_yield):
+                out[:] = preprocess(np.nan_to_num(fcf_yield[-1,:]))
+               
+        class Direction(CustomFactor):
+            inputs = [USEquityPricing.open, USEquityPricing.close]
+            window_length = 21
+            def compute(self, today, assets, out, open, close):
+                p = (close-open)/close
+                out[:] = preprocess(np.nansum(-p,axis=0))
+             
+        class mean_rev(CustomFactor):   
+            inputs = [USEquityPricing.open,USEquityPricing.high,USEquityPricing.low,USEquityPricing.close]
+            window_length = 14
+            def compute(self, today, assets, out, open, high, low, close):
+ 
+                p = (high+low+close+open)/4
+                rng = (high-low)/close
+ 
+                m = len(p)
+                a = np.zeros(m)
+ 
+                for k in range(1,m+1):
+                    a = preprocess(np.median(p[-k:,:],axis=0)/close[-1,:])
+                    w = np.nanmedian(rng[-k:,:],axis=0)
+                    a += w*a
+ 
+                out[:] = preprocess_two(a)
+             
+        class volatility(CustomFactor):
+            inputs = [USEquityPricing.high, USEquityPricing.low, USEquityPricing.close]
+            window_length = 4
+            def compute(self, today, assets, out, high, low, close):
+                vol = np.nansum(((high-low)/close),axis=0)
+                out[:] = preprocess(vol)
+       
+        class earning_yield(CustomFactor):            
+            inputs = [Fundamentals.earning_yield.latest.zscore(groupby=sector)]            
+            window_length = 1            
+            def compute(self, today, assets, out, earning):                
+                out[:] = preprocess(np.nan_to_num(earning[-1]))
+      
+        class equity_ev(CustomFactor):            
+            equity_sector = (Fundamentals.total_equity.latest / Fundamentals.enterprise_value.latest).zscore()            
+            inputs = [equity_sector]                      
+            window_length = 1                       
+            def compute(self, today, assets, out, equity):                 
+                equity_y = np.nan_to_num(equity[-1])                                       
+                out[:] = preprocess(equity_y)
+         
+        class Net_Per_Emp(CustomFactor):
+            inputs = [factset.Fundamentals.net_inc_per_emp_af]
+            window_length = 1
+            def compute(self, today, assets, out, net):
+                out[:] = preprocess(np.nan_to_num(net[-1]))
+        
+        class growthscore(CustomFactor):
+            inputs = [Fundamentals.growth_score]
+            window_length = 1
+            def compute(self, today, assets, out, growth_score):
+                gr = np.nan_to_num(growth_score[-1])
+                out[:] = preprocess(gr) 
+       
+        
+        class bps(CustomFactor):
+            inputs = [factset.Fundamentals.bps_gr_af]
+            window_length = 1
+ 
+            def compute(self, today, assets, out, bps):
+                bps = np.nan_to_num(bps[-1])
+                bps = stats.zscore(bps)
+                out[:] = preprocess(-bps)        
+       
+        class peg_ratio(CustomFactor):
+            inputs = [Fundamentals.earning_yield.latest.zscore() ,Fundamentals.diluted_eps_growth.latest.zscore()]
+            window_length = 1
+            def compute(self, today, assets, out, earn, growth):
+                peg = np.nan_to_num((earn[-1])/(1/growth[-1]))
+                peg = stats.zscore(peg)
+                out[:] = preprocess(peg)
+    
+        class MoneyflowVolume5d(CustomFactor):
+            inputs = (USEquityPricing.close, USEquityPricing.volume)
+
+            window_length = 6
+            
+            def compute(self, today, assets, out, close_extra, volume_extra):
+
+                close = close_extra[1:]
+                volume = volume_extra[1:]
+                
+                dollar_volume = close * volume
+                denominator = dollar_volume.sum(axis=0)
+                
+                difference = np.diff(close_extra, axis=0)
+                direction = np.where(difference > 0, 1, -1)
+                numerator = (direction * dollar_volume).sum(axis=0)
+                
+                out[:] = preprocess(-np.divide(numerator, denominator))
+             
+        class Trendline(CustomFactor):
+            inputs = [USEquityPricing.close]
+            window_length = 252
+            
+            _x = np.arange(window_length)
+            _x_var = np.var(_x)
+ 
+            def compute(self, today, assets, out, close):
+            
+                x_matrix = repeat_last_axis(
+                (self.window_length - 1) / 2 - self._x,
+                len(assets),
+                )
+ 
+                y_bar = np.nanmean(close, axis=0)
+                y_bars = repeat_first_axis(y_bar, self.window_length)
+                y_matrix = close - y_bars
+ 
+                out[:] = preprocess(-np.divide(
+                (x_matrix * y_matrix).sum(axis=0) / self._x_var,
+                self.window_length
+                ))
+       
+        class Revenue(CustomFactor):
+            inputs = [Fundamentals.total_revenue]
+            window_length = 252
+            def compute(self, today, assets, out, revenue):
+                out[:] = preprocess((revenue[-1] > revenue[0]).astype(int))
+
+        class GrossMarginChange(CustomFactor):
+            window_length = 252
+            inputs = [Fundamentals.gross_margin]
+            def compute(self, today, assets, out, gross_margin):
+                out[:] = preprocess((gross_margin[-1] > gross_margin[0]).astype(int))
+   
+        class Gross_Income_Margin(CustomFactor):
+            inputs = [Fundamentals.cost_of_revenue, Fundamentals.total_revenue]
+            window_length = 1
+            def compute(self, today, assets, out, cost_of_revenue, sales):
+                gross_income_margin = sales[-1]/sales[-1] - cost_of_revenue[-1]/sales[-1]
+                out[:] = preprocess(gross_income_margin)
+      
+        class revenue_to_assets(CustomFactor):
+            window_length = 252
+            inputs = [Fundamentals.fix_assets_turonver]
+            def compute(self, today, assets, out, revenue):
+                eq = np.nan_to_num(revenue[-1]-revenue[0])
+                eq = stats.zscore(eq)                  
+                out[:] = preprocess(eq)
+                
+       
+        class Cash_Change(CustomFactor):
+            change = (np.nan_to_num(Fundamentals.end_cash_position.latest) - np.nan_to_num(Fundamentals.beginning_cash_position.latest)) / np.nan_to_num(Fundamentals.beginning_cash_position.latest)
+            inputs = [change]
+            window_length = 1
+            def compute(self, today, assets, out, change):
+                total =  np.nan_to_num(change[-1])
+                total =  stats.zscore(total)
+                out[:] = preprocess(total)
+       
+        class Conversion(CustomFactor):
+            inputs = [Fundamentals.cash_conversion_cycle.latest.zscore()]
+            window_length = 1
+            
+            def compute(self, today, assets, out, conversion):
+                con = np.nan_to_num(1/conversion[-1])
+                out[:] = preprocess(con)
+     
+        class MaxGap(CustomFactor): 
+            inputs = [USEquityPricing.close] ; window_length = 90
+            def compute(self, today, assets, out, close):
+                abs_log_rets = np.abs(np.diff(np.log(close),axis=0))
+                max_gap = np.max(abs_log_rets, axis=0)
+                out[:] = preprocess(max_gap)
+    
+        class CapEx_Vol(CustomFactor):
+            inputs=[
+                Fundamentals.cap_ex_reported,
+                Fundamentals.total_assets,]
+            window_length = 126
+            def compute(self, today, assets, out, capex, total_assets):
+                v = capex/total_assets
+                v[np.isinf(v)] = np.nan
+                 
+                out[:] = preprocess(-np.ptp(v,axis=0))
+      
+        class fcf_ev(CustomFactor):
+            inputs=[
+                Fundamentals.fcf_per_share,
+                Fundamentals.shares_outstanding,
+                Fundamentals.enterprise_value,]
+            window_length = 1
+            def compute(self, today, assets, out, fcf, shares, ev):
+                v = np.nan_to_num((fcf[-1]*shares[-1])/ev[-1])
+                v_z = stats.zscore(v)
+                out[:] = preprocess(v_z)
+       
+        class cap(CustomFactor):
+            inputs=[
+                Fundamentals.capital_expenditure,
+                Fundamentals.enterprise_value,]
+            window_length = 1
+            def compute(self, today, assets, out, ca, en):
+                v = ca/en                
+                out[:] = preprocess(v[-1])       
+      
+        class pare(CustomFactor):
+            inputs=[
+                Fundamentals.free_cash_flow,
+                Fundamentals.total_assets,]
+            window_length = 252
+            def compute(self, today, assets, out, fcf, ase):
+                pare = np.nan_to_num(fcf[-1]/ase[-1] - fcf[0]/ase[0])
+                pare = stats.zscore(pare)                  
+                out[:] = preprocess(pare)
+      
+        class treasury(CustomFactor):
+            inputs=[Fundamentals.com_tre_sha_num, Fundamentals.shares_outstanding]
+            window_length = 1
+            def compute(self, today, assets, out, tre, sha):
+                v = tre/sha                
+                out[:] = preprocess(np.nan_to_num(v[-1]))
+      
+        class DebtToTotalAssets(CustomFactor):            
+            inputs = [Fundamentals.long_term_debt,              
+                      Fundamentals.current_debt,              
+                      Fundamentals.cash_and_cash_equivalents,              
+                      Fundamentals.total_assets]            
+            window_length = 1                        
+            def compute(self, today, assets, out, ltd, std, cce, ta):                
+                std_part = np.maximum(std - cce, np.zeros(std.shape))                
+                v = np.divide(ltd + std_part, ta)                
+                v[np.isinf(v)] = np.nan
+                out[:] = preprocess(-np.ravel(v))
+   
+        class TEM(CustomFactor):
+
+            inputs=[factset.Fundamentals.capex_qf_asof_date,
+                factset.Fundamentals.capex_qf,
+                factset.Fundamentals.assets]
+            window_length = 390
+            def compute(self, today, assets, out, asof_date, capex, total_assets):
+                values = capex/total_assets
+                values[np.isinf(values)] = np.nan
+                out_temp = np.zeros_like(values[-1,:])
+                for column_ix in range(asof_date.shape[1]):
+                    _, unique_indices = np.unique(asof_date[:, column_ix], return_index=True)
+                    quarterly_values = values[unique_indices, column_ix]
+                    if len(quarterly_values) < 6:
+                        quarterly_values = np.hstack([
+                        np.repeat([np.nan], 6 - len(quarterly_values)),
+                        quarterly_values,
+                        ])
+            
+                    out_temp[column_ix] = np.std(quarterly_values[-6:])
+                    out_temp = np.nan_to_num(out_temp)
+                    out_temp_z = stats.zscore(out_temp)
+                out[:] = preprocess(-out_temp_z)
+         
+        class Piotroski(CustomFactor):
+            inputs = [
+                    Fundamentals.roa,
+                    Fundamentals.operating_cash_flow,
+                    Fundamentals.cash_flow_from_continuing_operating_activities,
+                    Fundamentals.long_term_debt_equity_ratio,
+                    Fundamentals.current_ratio,
+                    Fundamentals.shares_outstanding,
+                    Fundamentals.gross_margin,
+                    Fundamentals.assets_turnover,
+                    ]
+ 
+            window_length = 100
+    
+            def compute(self, today, assets, out,roa, cash_flow, cash_flow_from_ops, long_term_debt_ratio, current_ratio, shares_outstanding, gross_margin, assets_turnover):
+            
+                profit = (
+                            (roa[-1] > 0).astype(int) +
+                            (cash_flow[-1] > 0).astype(int) +
+                            (roa[-1] > roa[0]).astype(int) +
+                            (cash_flow_from_ops[-1] > roa[-1]).astype(int)
+                         )
+        
+                leverage = (
+                            (long_term_debt_ratio[-1] < long_term_debt_ratio[0]).astype(int) +
+                            (current_ratio[-1] > current_ratio[0]).astype(int) + 
+                            (shares_outstanding[-1] <= shares_outstanding[0]).astype(int)
+                            )
+        
+                operating = (
+                            (gross_margin[-1] > gross_margin[0]).astype(int) +
+                            (assets_turnover[-1] > assets_turnover[0]).astype(int)
+                            )
+        
+                out[:] = preprocess(profit + leverage + operating)
+            
+        class Altman_Z(CustomFactor):
+            inputs=[factset.Fundamentals.zscore_qf]
+            window_length = 1
+            def compute(self, today, assets, out, zscore_qf):
+                out[:] = preprocess(-zscore_qf[-1])
+       
+        class Quick_Ratio(CustomFactor):
+            inputs=[Fundamentals.quick_ratio]
+            window_length = 1
+            def compute(self, today, assets, out, quick):
+                v = np.nan_to_num(quick[-1])
+                v_z = stats.zscore(v)
+                out[:] = preprocess(v_z)
+ 
+        class Advanced_Momentum(CustomFactor):
+            inputs = [USEquityPricing.close, Returns(window_length = 4)]
+            window_length = 126
+          
+            def compute(self, today, assets, out, close, returns):
+                result = np.nan_to_num(((close[-4] - close[-126])/close[-126]  - (close[-1] - close[-4])/close[-4]) * np.nanstd(returns, axis = 0))
+                result = np.abs(result)
+                result_z = stats.zscore(result)
+                out[:] = preprocess(result_z)
+                
+        class Advanced_Momentum2(CustomFactor):
+            inputs = [USEquityPricing.close, Returns(window_length = 4)]
+            window_length = 126
+          
+            def compute(self, today, assets, out, close, returns):
+                result = np.nan_to_num(((close[-4] - close[-126])/close[-126]  - (close[-1] - close[-4])/close[-4]) * np.nanstd(returns, axis = 0))
+                result_z = stats.zscore(result)
+                out[:] = preprocess(result)
+
+        # dictionary of (factor,factor weight)                                                                                  
+        return {
+            'inv_volatility':          (inv_volatility,1),
+            'MessageSum':              (MessageSum,1),
+            'FCF':                     (fcf,1),
+            'Direction':               (Direction,1),
+            'mean_rev':                (mean_rev,1),
+            'volatility':              (volatility,1),          
+            'earning_yield':           (earning_yield,1),
+            'equity_ev':               (equity_ev,1),
+            'Net_Per_Emp':             (Net_Per_Emp,1),
+            'growthscore':             (growthscore,1),
+            'bps':                     (bps,1),
+            'PegRatio':                (peg_ratio,1),
+            'MoneyFlow':               (MoneyflowVolume5d,1),
+            'Trendline':               (Trendline,1),
+            'Revenue':                 (Revenue,1),
+            'GrossMarginChange':       (GrossMarginChange,1),
+            'Gross_Income_Margin':     (Gross_Income_Margin,1),
+            'revenue_to_assets':       (revenue_to_assets,1),
+            'Cash_Change':             (Cash_Change,1),
+            'Conversion':              (Conversion,1),
+            'MaxGap':                  (MaxGap,1),
+            'CapEx_Vol':               (CapEx_Vol,1),
+            'fcf_ev':                  (fcf_ev,1),
+            'cap':                     (cap,1),
+            'pare':                    (pare,1),
+            'treasury':                (treasury,1),
+            'DebtToTotalAssets':       (DebtToTotalAssets,1),
+            'CapEx_Vol_fs':            (TEM,1),
+            'Piotroski':               (Piotroski,1),
+            'Altman_Z':                (Altman_Z,1),
+            'Quick_Ratio':             (Quick_Ratio,1),
+            'Advanced_Momentum':       (Advanced_Momentum,1),
+            'Advanced_Momentum2':      (Advanced_Momentum2,1),
+        }
+    
+    
+       
+    
+def make_pipeline():
+    pricing = USEquityPricing.close.latest
+    
+    universe = QTradableStocksUS() & (pricing > 1) 
+    
+    #FACTORS
+    factors = make_factors()
+    
+    combined_alpha = None
+    for name, (f,w) in factors.iteritems():
+        if combined_alpha == None:
+            combined_alpha = w*f(mask=universe)
+        else:
+            combined_alpha += w*f(mask=universe)
+            
+    beta = SimpleBeta(target=sid(8554),regression_length=260,
+                      allowed_missing_percentage=1.0
+                     )
+ 
+    pipe = Pipeline(columns = {
+        'combined_alpha':combined_alpha,
+        'beta':beta,
+    },
+    screen = universe)
+    return pipe
+
+ 
+def initialize(context):
+ 
+    attach_pipeline(make_pipeline(), 'pipeline_1')
+    attach_pipeline(risk_loading_pipeline(), 'risk_loading_pipeline')
+ 
+    # Schedule my rebalance function
+    schedule_function(func=rebalance,
+                      date_rule=date_rules.every_day(),
+                      time_rule=time_rules.market_open(minutes = 59),
+                      half_days=True)
+    
+    # record my portfolio variables at the end of day
+    schedule_function(func=recording_statements,
+                      date_rule=date_rules.every_day(),
+                      time_rule=time_rules.market_close(),
+                      half_days=True)
+    
+    context.init = True
+    
+    set_commission(commission.PerShare(cost=0, min_trade_cost=0))
+    set_slippage(slippage.FixedSlippage(spread=0))
+    
+def before_trading_start(context, data):
+    
+    context.pipeline_data = pipeline_output('pipeline_1')
+    context.risk_loadings = pipeline_output('risk_loading_pipeline')
+    context.risk_loadings.dropna(inplace=True)
+ 
+def recording_statements(context, data):
+ 
+    record(num_positions=len(context.portfolio.positions))
+    record(leverage=context.account.leverage)
+
+  
+def orthogonalize_alpha(pos_pct, risk_loadings, return_coeffs=False):  
+    from sklearn import linear_model  
+
+
+    def _run_regression(pos_dt, risk_loadings_dt):
+        overlap_sids = sorted(list(set(pos_dt.index).intersection(set(risk_loadings_dt.dropna().index.tolist()))))  
+        pos_dt = pos_dt.reindex(overlap_sids)  
+        risk_loadings_dt = risk_loadings_dt.loc[overlap_sids]
+        clf = linear_model.LinearRegression()  
+        clf.fit(risk_loadings_dt, pos_dt)  
+        resid = pos_dt - clf.predict(risk_loadings_dt)  
+        return resid, clf.coef_
+    
+    if isinstance(pos_pct, pd.DataFrame):
+        pos_resid = {}   
+        coeffs = pd.DataFrame(index=pos_pct.index, columns=risk_loadings.columns)    
+ 
+        for dt in pos_pct.index:  
+            if (dt not in pos_pct.index) or (dt not in risk_loadings.index.get_level_values(0)):  
+                continue
+            pos_resid[dt], coeffs.loc[dt] = _run_regression(pos_pct.loc[dt].dropna(), 
+                                                            risk_loadings.loc[dt])
+        
+        pos_resid = pd.concat(pos_resid)  
+        coeffs = pd.DataFrame(coeffs).T
+        
+    elif isinstance(pos_pct, pd.Series):
+        pos_resid, coeffs = _run_regression(pos_pct, risk_loadings)
+        
+    else:
+        raise ValueError('Pass either DataFrame or Series.')
+    
+    if return_coeffs:
+        return pos_resid, coeffs 
+    else:
+        return pos_resid
+
+
+def rebalance(context, data):
+    
+    combined_alpha = context.pipeline_data.combined_alpha  
+    risk_loadings = context.risk_loadings
+ 
+    # demean and normalize
+    combined_alpha = combined_alpha - combined_alpha.mean()
+    denom = combined_alpha.abs().sum()
+    combined_alpha = combined_alpha/denom
+    #orth_alpha = orthogonalize_alpha(combined_alpha, risk_loadings)
+    #objective = opt.MaximizeAlpha(orth_alpha)
+    
+    objective = opt.TargetWeights(combined_alpha)
+    
+    #objective = opt.MaximizeAlpha(combined_alpha)
+    
+    constraints = []
+    
+    constraints.append(opt.MaxGrossExposure(1.0))
+    
+    constraints.append(opt.DollarNeutral())
+    
+    constraints.append(
+        opt.PositionConcentration.with_equal_bounds(
+            min=-MAX_POSITION_SIZE,
+            max=MAX_POSITION_SIZE
+        ))
+    
+    risk_model_exposure = opt.experimental.RiskModelExposure(
+        context.risk_loadings,
+        version=opt.Newest,
+    )
+      
+    constraints.append(risk_model_exposure)
+    
+    beta_neutral = opt.FactorExposure(
+        loadings=context.pipeline_data[['beta']],
+        min_exposures={'beta':-BETA_EXPOSURE},
+        max_exposures={'beta':BETA_EXPOSURE}
+        )
+    constraints.append(beta_neutral)
+    
+    if context.init:
+        order_optimal_portfolio(
+                objective=objective,
+                constraints=constraints,
+                )
+        context.init = False
+        return
+    
+    turnover = np.linspace(MIN_TURN,0.65,num=100)
+    
+    for max_turnover in turnover:
+        
+        constraints.append(opt.MaxTurnover(max_turnover))
+        
+        try:
+            order_optimal_portfolio(
+                objective=objective,
+                constraints=constraints,
+                )
+            constraints = constraints[:-1]
+            record(max_turnover = max_turnover)
+            return
+        except:
+            constraints = constraints[:-1]
+ 
+def preprocess(a):
+    
+    a = a.astype(np.float64)
+    
+    a[np.isinf(a)] = np.nan
+    
+    a = np.nan_to_num(a - np.nanmean(a))
+    
+    a = winsorize(a, limits=[WIN_LIMIT,WIN_LIMIT])
+    
+    return preprocessing.scale(a)
